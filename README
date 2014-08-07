@@ -1,0 +1,89 @@
+Summary
+---------------------
+
+MetaVPN is a tool that wraps the configuration details of using
+OpenVPN so people with only a conceptual understanding of VPNs
+can use it. The details of setting up an OpenVPN instance are
+wrapped, and people can easily create and manage multiple VPNs at
+the same time. The details of getting a configuration/SSLkey pairing
+for the user are also handled.
+
+State of the code
+----------------------
+
+Beta. Users should be willing to tweak some simple configuration
+parameters at the head of the relevant scripts as appropriate for
+their network. This is still easier than learning OpenVPN.
+
+Prerequisites
+----------------------
+Perl 5.8 or higher
+Nonstandard perl modules: SDBM_File, MLDBM, File::Copy, File::Path, Archive::Tar, CGI, DBI
+	Some of these modules may not be needed depending on which utilities
+	you intend to use
+You do not need Emulab to use MetaVPN (using the "loosely managed" key management)
+
+Files
+----------------------
+        docs/   - Development documentation, unlikely to be of interest.
+        ezpurge - Script to completely remove the configuration
+                database and files for all VPNs
+        metavpn - Primary script, creates, configures, and manages VPNs
+        metv_import_openvpn_keys - For those going with a
+                tightly-managed VPN, this imports the node keys into
+                the emulab database
+        metv_direct_keygen - For those going with a loosely-managed VPN,
+                this generates a configuration tarball for a given client
+        serve_openvpn_keys.cgi - For those going with a tightly-managed
+                VPN, this serves the node keys to clients using a CGI
+                interface
+        openvpn-clients.cfg - Template openvpn config for clients, used
+                by both serve_openvpn_keys and metv_direct_keygen
+
+Details
+-----------------------
+MetaVPN is a wrapper for the OpenVPN software. OpenVPN is a popular
+VPN server. It is a powerful package with a steep learning curve
+and a lack of tools to automate common tasks. MetaVPN attempts to
+lessen the learning curve down to understanding VPN basics, as well
+as reduce the labour needed to configure each VPN. OpenVPN clients must
+each have a unique key permitting them access (and identifying them),
+as well as a configfile with settings that approriately match that on
+the server.
+
+MetaVPN can function in two environments, tightly integrated and loosely
+integrated. In the first, MetaVPN has a single shared instance that
+manages VPNs from potentially a number of people, typically on ops.
+OpenVPN client keys are stored inside the database on boss, and clients
+can use a simple wget-wrapping client to request a configuration tarball
+needed to
+allow them to join the VPN. In the second, MetaVPN can be run on an
+experimental node (or even a non-testbed system outside the Emulab
+environment). In this instance, the person managing that VPN will use
+metv_direct_keygen to directly make tarballs for all clients.
+
+In either environment, the user can use metavpn to see the state of all
+configured VPNs, bring them up or down, add new client keys, create new
+VPNs, or archive/delete VPNs.
+
+Getting Started
+-----------------------------
+After unpacking the software, look at the head of each script that
+you intend to use, changing any paths or other configuration details
+to your liking. In each script, any configuration you may need to
+change exists before the call to main(). Look at the "test1" script
+for simple commands that you might run to setup a VPN. MetaVPN will
+need to be run as root if it is to actually bring VPNs up or down -
+otherwise it will only be able to create configurations and manage
+nodekeys.
+
+Future Development/Bugs
+-----------------------------
+Right now, tap VPNs (Layer 2) are the only kind configurable with this tool.
+tun VPNs (Layer 3) will be supported in a future version provided a sensible
+way to manage bridging, avoid IP collisions, etc. can be found. Some
+configuration variables that are presently hardcoded in the head of
+several scripts will be used into the databases MetaVPN uses so the
+scripts themselves will not need to change so much on a per-site basis.
+Documentation will be improved, and a tutorial covering a simple usage
+will be written.

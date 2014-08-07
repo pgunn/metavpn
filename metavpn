@@ -1,0 +1,890 @@
+#!/usr/bin/perl -U 
+
+use warnings;
+no warnings qw(taint);
+use strict;
+umask(000);
+#my $dbdir = '/var/metapn'; # This directory must exist.
+my $dbdir = '/usr/local/opt/metavpn/var'; # testing purposes
+my $vpncfgdir = "$dbdir/cfgs";
+my $easyrsa_template = '/usr/local/share/doc/openvpn/easy-rsa/2.0'; # ops
+#my $easyrsa_template = '/usr/local/share/doc/openvpn/easy-rsa/2.0'; # lachesis
+#my $easyrsa_template = '/usr/share/openvpn/easy-rsa/2.0'; # linux
+
+my $bindir = "$dbdir/openvpn_sslscripts";
+my $pname = "MetaVPN"; # Managed OpenVPN will take this name prefix
+
+my $archive_old_configs = "$dbdir/oldcfgs"; 	# If set, when a vpn is decomissioned, move its
+						# config here rather than delete it
+#my $archive_old_configs = undef;
+my $never_rm = 1; # Don't ever remove old files, just say you will. Use for debug.
+
+my ($country, $state, $city, $org, $email) =
+	(
+	'US',
+	'PA',
+	'Pittsburgh',
+	'CMU-CS-CMULAB-OPENVPN-DYNAMIC',
+	'pgunn@cs.cmu.edu'
+	); # Customise me, please!
+
+use Cwd;
+use SDBM_File;
+use MLDBM qw(SDBM_File);
+use Fcntl qw/:DEFAULT :flock/; # For DBM constants and flock()
+use File::Copy;
+use File::Path 'make_path'; # mkdir -p
+
+presetup(); # Set up directories and stuff
+main();
+
+# This software available under terms of the GENI public license, viewable at
+# http://www.geni.net/office/office_ip.html
+#########################
+# OpenVPN manager. This creates or tears down an OpenVPN tunnel with a specified
+# topology and members. This is only used for the dataplanes - the control
+# plane connections are static.
+#
+# Requires: If we want to support tun style connections, OpenVPN 2.1 for
+#	--topology subnet.
+#########################
+
+# MetaVPN keeps some dbm-based persistent state.
+# Including:
+#	The configuration of each VPN
+#		port
+#		type (tun or tap)
+#		keys that can connect (static IPs for tun)
+#		routes added (TUN only?)
+#		IP ranges (for tun, so we can try to avoid address space overlaps) (TUN only)
+#		shouldbeup
+#		Experiment
+#		Experiment-networkid
+#		etc
+#	A list of keys that have been generated in each OpenVPN
+#
+# It presumably should also tell the emulab-openvpn configserver the info it
+#	needs for clients to query about the networks they're on and get all
+#	the configs they want.
+
+##############################################################################
+
+sub main
+{
+my %todo = handle_args(@ARGV);
+my %cm = callmap();
+my $fn = $cm{$todo{cmd}};
+if(! defined $fn)
+	{usage();}
+
+&$fn(@{$todo{args}});
+}
+
+sub handle_args
+{
+my @args = @_;
+my %ret;
+
+
+if(! @args){usage();}
+$ret{cmd} = shift @args;
+$ret{args} = \@args;
+return %ret;
+}
+
+sub usage
+{
+die "Usage: metavpn COMMAND ARGS\n"
+.	"\tCommands (these run only on metavpn-managed VPNs):\n"
+.	"\t\tshow - Show configured VPNs\n"
+.	"\t\tupall - Bring up all VPNs\n"
+.	"\t\tdownall - Bring down all VPNs\n"
+.	"\t\tup VPNID - Bring up the given VPN\n"
+.	"\t\tdown VPNID - Bring down the given VPN\n"
+.	"\t\tadd PARAMS - Add a VPN with the given params, returns a VPNID\n"
+.	"\t\t\tPARAMS are key=value pairs. Valid params:\n"
+.	"\t\t\tport=number\n"
+.	"\t\t\ttype=(tun,tap)\n"
+.	"\t\t\texp=single_word_experiment_identifier\n"
+.	"\t\t\texpnwk=single_word_nwk_identifier\n"
+.	"\t\t\tFor tun networks (not yet supported), there will be\n"
+.	"\t\t\tadditional params required.\n"
+.	"\t\tdel VPNID - Delete the given VPN\n"
+.	"\t\tnodeadd VPNID NODE - Add NODE to the given VPN\n"
+.	"\t\tpurge - Delete all VPNs\n"
+.	"\t\treallypurge - Delete all VPNs, ignore all errors\n";
+}
+
+sub callmap
+{
+my %map = (	'show' 		=> \&dispatch_show,
+		'upall' 	=> \&dispatch_upall,
+		'downall' 	=> \&dispatch_downall,
+		'up'		=> \&dispatch_up,
+		'down'		=> \&dispatch_down,
+		'add'		=> \&dispatch_add,
+		'del'		=> \&dispatch_del,
+		'nodeadd'	=> \&dispatch_nodeadd,
+		'purge'		=> \&dispatch_purge,
+		'reallypurge'	=> \&dispatch_reallypurge);
+return %map;
+}
+
+#############################################################
+# Dispatch functions. If we ever rework these into a library, we'll
+#	want to separate the data-gathering from the display. For now, let's
+#	just make it easy to machine-parse. "\t+" will be the delimiter, and
+#	consequently no fields can be blank. 
+
+sub dispatch_show
+{
+my $joinbit = ',';
+print join($joinbit, qw/vpnid exp expnet status type server port keys/) . "\n";
+#foreach my $vpn (all_vpns())
+foreach my $vpn (sort {$a <=> $b} all_vpns())
+	{
+	my %info = vpn_info($vpn);
+	my $dbstatus = vpn_status($vpn, $info{shouldbeup});
+	print safejoin($joinbit, $vpn, $info{exp}, $info{expnwk}, $dbstatus, $info{type}, $info{server}, $info{port}, $info{ovkeys}) . "\n";
+	}
+}
+
+sub dispatch_downall
+{
+foreach my $vpn (all_vpns())
+	{
+	print "Bringing down vpn $vpn\n";
+	do_down_vpn($vpn);
+	}
+}
+
+sub dispatch_upall
+{
+foreach my $vpn (all_vpns())
+	{
+	print "Bringing up vpn $vpn\n";
+	do_up_vpn($vpn);
+	}
+}
+
+sub dispatch_up
+{
+my ($vpn) = @_;
+if(! identifier_is_valid($vpn))
+	{die "Invalid vpn [$vpn] requested\n";}
+if(! vpn_exists($vpn))
+	{die "VPN $vpn does not exist!\n";}
+
+print "Bringing up vpn $vpn\n";
+do_up_vpn($vpn);
+}
+
+sub dispatch_down
+{
+my ($vpn) = @_;
+if(! identifier_is_valid($vpn))
+	{die "Invalid vpn [$vpn] requested\n";}
+if(! vpn_exists($vpn))
+	{die "VPN $vpn does not exist!\n";}
+
+print "Bringing down vpn $vpn\n";
+do_down_vpn($vpn);
+}
+
+sub dispatch_del
+{ # Must make sure the vpn is down before deleting it. Then remove its config.
+# Consider making this a non-dispatch, because dispatch_purge should call it.
+my ($vpn) = @_;
+if(! identifier_is_valid($vpn))
+	{die "Invalid vpn [$vpn] requested\n";}
+
+my ($ok,$msg) = do_del_vpn($vpn);
+if(! $ok)
+	{print "Failed to bring down VPN $vpn: $msg\n";}
+print "Brought VPN $vpn down\n";
+}
+
+sub dispatch_add
+{ # Hoo boy is this going to be an ugly function, because it must do everything in the world.
+my @params = @_;
+my %holder;
+my $vpn = make_new_vpnid();
+foreach my $param (@params)
+	{
+	$param =~ /^([A-Za-z_]+)=([A-Za-z0-9_]+)/;
+	my ($key, $val) = ($1, $2);
+	if( (! defined($key)) || (! defined($val)) )
+		{
+		die "Error in parsing params: bad pair [$param]\n";
+		}
+	$holder{$key} = $val;
+	}
+foreach my $reqparam (qw/port type exp expnwk/)
+	{
+	if(! defined($holder{$reqparam}))
+		{
+		die "Required parameter [$reqparam] not found\n";
+		}
+	}
+# At this point it looks probably ok, so let's record it in our database.
+
+$holder{ovkeys} = 0; # This holds a count of registered keys for this VPN. Initialise to 0
+vpn_initsettings($vpn, \%holder);
+
+# Now that that's done, it's time to generate the config files.
+generate_openvpn_server($vpn, 'udp', $holder{port}, $holder{type}); # XXX We'll need to extend this if/when we
+									# support tuns.
+return $vpn;
+}
+
+sub dispatch_purge
+{
+foreach my $vpn (all_vpns())
+	{
+	print "Bringing down VPN $vpn\n";
+	my ($ok, $msg) = do_del_vpn($vpn);
+	if(! $ok)
+		{print "Failed to bring down VPN $vpn: $msg\n";}
+	}
+}
+
+sub dispatch_reallypurge
+{ # FIXME For now, we'll do this manually. Eventually, we should do this better.
+#foreach my $vpn (all_vpns())
+#	{
+#	print "Bringing down VPN $vpn\n";
+#	my ($ok, $msg) = do_del_vpn($vpn);
+#	if(! $ok)
+#		{print "Failed to bring down VPN $vpn: $msg\n";}
+#	}
+}
+
+sub dispatch_nodeadd
+{
+my ($vpn, $node) = @_;
+if(! vpn_exists($vpn))
+	{die "VPN $vpn does not exist!\n";}
+
+if(! identifier_is_valid($vpn))
+	{die "Invalid vpn [$vpn] requested\n";}
+if(! identifier_is_valid($node))
+	{die "Invalid client identifier [$node] requested\n";}
+
+vpn_addnode($vpn, $node) || die "Could not add node [$node] to VPN [$vpn]\n";
+}
+
+#############################################################
+# Intermediate functions that do things
+
+sub do_del_vpn
+{ # Remove info pertaining to a VPN (bring it down first if it's up)
+my ($vpn) = @_;
+
+if(! vpn_exists($vpn))
+	{die "That VPN does not exist!\n";}
+
+my $ok = 1; # If we learn about ways this can fail, then
+my $msg = ''; # twiddle these around.
+
+my %info = vpn_info($vpn);
+my $status = vpn_status($vpn, $info{shouldbeup});
+while( ($status eq 'ISUP') || ($status eq 'WEDG')) # Let's make sure the vpn is truly down before moving on..
+	{ # Put a timeout here?
+	print "Bringing down VPN...\n";
+
+	do_down_vpn($vpn);
+	sleep(2);
+	%info = vpn_info($vpn);
+	$status = vpn_status($vpn, $info{shouldbeup});
+	}
+#print "VPN is down. Removing configuration\n";
+free_vpn_nodes($vpn, @{$info{nodes}} );
+remove_vpn_config($vpn); # XXX Do *not* flip the order on these - we need the VPN still registered here so
+			# the archive can include a dump of the DB state.
+vpn_deregister($vpn);
+return ($ok, $msg);
+}
+
+sub do_up_vpn
+{ # Start the openvpn process for a VPN
+my ($vpn) = @_;
+
+#my %info = vpn_info($vpn); # FIXME Why?
+vpn_dbchstatus($vpn, 'UP');
+my $procname = $pname . "[$vpn]";
+up_vpn("$vpncfgdir/$vpn", $vpn, $procname);
+sleep(2);
+my $status = vpn_status($vpn, 1);
+if($status ne 'ISUP')
+	{die "Failed to bring up vpn $vpn. Try starting it manually.\nAborted.\n";}
+}
+
+sub do_down_vpn
+{ # Bring down a vpn
+my ($vpn) = @_;
+#my %info = vpn_info($vpn); # FIXME Why?
+
+vpn_dbchstatus($vpn, 'DOWN');
+if(! vpn_pid($vpn))
+	{die "VPN $vpn doesn't seem to be up\n";}
+
+down_pid(vpn_pid($vpn));
+sleep(2);
+if(vpn_pid($vpn))
+	{
+	down_pid(vpn_pid($vpn), 'RUDE');
+	}
+if(vpn_pid($vpn))
+	{
+	die "Failed to bring down VPN - process wedged?\n";
+	}
+}
+
+#############################################################
+# "VPN" functions
+
+sub vpn_status
+{ # Given a vpnid, return whether it is up or not (checking the process tree)
+	# Returns:
+	# "ISUP" = DB+ PID+
+	# "DOWN" = DB- PID-
+	# "WEDG" = DB- PID+
+	# "FAIL" = DB+ PID-
+my ($vpnid, $dbplus) = @_;
+my $pid = vpn_pid($vpnid);
+return ($dbplus ? ($pid ? "ISUP" : "FAIL")
+		: ($pid ? "WEDG" : "DOWN"));
+
+}
+
+#################################################
+# VPN Configuration stuff
+
+# generate_openvpn_server() is used to create the configs.
+
+sub generate_openvpn_server
+{ # This function has a lot to do.
+my ($vpn, $proto, $port, $type, @tuninfo) = @_;
+
+if($type eq 'tun')
+	{die "tun networks are not currently supported\n";} # TODO
+elsif($type ne 'tap')
+	{die "that network type is not currently supported\n";} # TODO
+
+if($vpn eq '')
+	{die "invalid vpn directory\n";}
+
+my $cfgdir = "$vpncfgdir/$vpn";
+if($cfgdir =~ /\.\./) # Light sanity check
+	{die "Internal error: No parenting of directories permitted in metavpn config generation\n";}
+if(-e $cfgdir)
+	{die "Internal error: OpenVPN cfgdir [$cfgdir] already exists!\n";}
+
+mkdir($cfgdir)			|| die "Failed to create configdir $cfgdir:$!\n";
+mkdir("$cfgdir/easy-rsa")	|| die "Failed to create configdir rsadir:$!\n";
+mkdir("$cfgdir/easy-rsa/keys")	|| die "Failed to create configdir keydir:$!\n";
+
+generate_certificate_authority("$cfgdir/easy-rsa", $vpn);
+open(NEWCFG, ">$cfgdir/openvpn.conf") || die "Could not open new cfgfile $cfgdir/openvpn.conf: $!\n";
+print NEWCFG "port $port\n";
+print NEWCFG "proto $proto\n";
+print NEWCFG "dev $type\n";
+print NEWCFG "mode server\n";
+print NEWCFG "tls-server\n";
+#print NEWCFG "dev " . get_a_device($type) . "\n"; # We hopefully can avoid doing this, because it's an awful thing to try to manage.
+print NEWCFG "ca $cfgdir/easy-rsa/keys/ca.crt\n";
+print NEWCFG "cert $cfgdir/easy-rsa/keys/controller.crt\n";
+print NEWCFG "key $cfgdir/easy-rsa/keys/controller.key\n";
+print NEWCFG "dh $cfgdir/easy-rsa/keys/dh1024.pem\n";
+print NEWCFG "status $cfgdir/openvpn-status.log\n";
+print NEWCFG "client-to-client\n"; # This might not be necessary for tap networks.
+print NEWCFG "keepalive 10 120\n"; 
+print NEWCFG "persist-key\n"; 
+print NEWCFG "topology subnet\n"; # Requires OpenVPN 2.1
+print NEWCFG "verb 4\n"; 
+if($type eq 'tun')
+	{ # Currently just an unreachable stub. Here we would insert a server line, ip pool persistence, routes to push, etc.
+	}
+close(NEWCFG);
+}
+
+sub generate_certificate_authority
+{
+	# Create a key authority, fill in keys/ca.crt keys/controller.crt keys/controller.key keys/dh1024.pem
+	# TODO: Figure out how to do error checking for what's done here. It's possibly error-prone, so this is important!
+my ($dir, $vpn) = @_; # The vpn is just used as light seasoning of the configfiles, nothing important.
+
+# Steps (See http://moo.cmcl.cs.cmu.edu/wiki/index.php/USBImage_notes ):
+# 1) Copy easy-rsa template into directory
+#	Source: $easyrsa_template
+# 2) Customise the easy-rsa/vars (let's try to skip this, actually)
+# 3) Source that vars (actually, maybe it'd be easier to just temporarily set the right environment variables in perl and skip that?) (skip sourcing, just set the env vars directly)
+# 4) Run easy-rsa/clean-all
+# 5) Do the equivalent of easy-rsa/build-ca (but without any user input)
+# 6) Do the equivalent of easy-rsa/build-key-server (but without any user input)
+# 7) Do the equivalent of easy-rsa/build-dh (does this need user input?)
+
+local $< = $>; 	# SetUID scripts are handled differently than SetUID binaries by some kernels,
+		# Because we *really* want this run as root, we need to stop the kernel from dropping
+		# permissions "for" us. Setting our UID to our EUID is the way to do that.
+set_openssl_environment($dir);
+my $here = getcwd();
+chdir($dir) || die "Failed to enter ssldir\n";
+`$bindir/clean-all`;
+`$bindir/pkitool --initca`;
+#`$bindir/pkitool --server $vpn`;
+`$bindir/pkitool --server controller`;
+`openssl dhparam -out keys/dh$ENV{KEY_SIZE}.pem $ENV{KEY_SIZE}`;
+chmod(0777,"$dir/keys"); # clean-all messes this up
+chdir($here); # Return to where we were before...
+}
+
+sub remove_vpn_config
+{ # Remove or archive files that store a VPN configuration
+my ($vpn) = @_;
+if(defined $archive_old_configs)
+	{
+	if( -d "$archive_old_configs/$vpn")
+		{die "Failed to archive vpn [$vpn]: Archive already exists!\n";}
+
+	move("$vpncfgdir/$vpn", "$archive_old_configs/$vpn") || die "Failed to archive vpn [$vpn]:$!\n";
+	my %vpninfo = vpn_info($vpn);
+	if(%vpninfo) # Check just in case someone has somehow deregistered it first...
+		{
+		open(DBDUMPFILE, ">$archive_old_configs/$vpn/dbstate") || die "Failed to create database dump file in archive directory: $!\n";
+		print DBDUMPFILE join("\n", map {"$_ => $vpninfo{$_}"} keys %vpninfo); # Make a file containing all the state representing the database.
+		print DBDUMPFILE "\n";
+		close(DBDUMPFILE);
+		}
+	}
+else	# We're not asked to archive, just to delete.
+	{
+	if(! $never_rm)
+		{
+		system("/bin/rm", "-r", "$vpncfgdir/$vpn"); # This makes me nervous, but we already have vetted the $vpn..
+		if( -d "$vpncfgdir/$vpn")
+			{die "Failed to remove $vpncfgdir/$vpn: $!\n";}
+		}
+	else
+		{print("WOULD: /bin/rm -r $vpncfgdir/$vpn but you asked me not to.\n");}
+
+	}
+}
+
+#############################################################
+# "Database" functions
+#
+# Databases:
+#	vpninfo
+#		{vpnid}
+#			{shouldbeup}
+#			{nodes} @
+#			{type}
+#			{iface}
+#			{server}
+#			{port}
+#			{exp}
+#			{expnet}
+#			{ovkeys}
+#
+#	keys
+#		{vpnid}
+#			{keyid}
+#				(note that the needed info to make client configs is
+#				in $vpncfgdir/$vpn/keys/$keyid* and some other files in that
+#				directory)
+
+sub all_vpns
+{ # Fetch name and number for all VPNs
+my %vpninfo;
+my @vpns;
+
+no strict 'subs'; # FIXME hack
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict;
+@vpns = keys %vpninfo;
+untie(%vpninfo);
+return @vpns;
+}
+
+sub vpn_info
+{
+my ($vpnid) = @_;
+my %ret;
+
+my %vpninfo;
+no strict 'subs';
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict;
+my $retcpy = $vpninfo{$vpnid}; # We need to do a deep copy before untie, I think.
+foreach my $key (keys %$retcpy)
+	{
+#	print "D: read VPNINFO{$vpnid}{$key} = $$retcpy{$key}\n";
+	$ret{$key} = $$retcpy{$key};
+	}
+#print "Seeking vpn $vpnid\n";
+#print "BEGIN\n";
+#print map {"\tLALA=$_\n"} (keys %vpninfo);
+#print "END\n";
+untie(%vpninfo);
+return %ret;
+}
+
+sub vpn_dbchstatus
+{ # Note it up or down. 
+my ($vpn, $status) = @_;
+if($status eq 'UP') {$status = 1;}
+if($status eq 'DOWN') {$status = 0;}
+
+my %vpninfo;
+no strict 'subs'; # FIXME hack
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict;
+my %vpnstate = %{$vpninfo{$vpn}};
+$vpnstate{shouldbeup} = $status;
+$vpninfo{$vpn} = \%vpnstate; # Again, MLDBM isn't magical enough to allow this to be simply toggled - we must unpack and repack.
+#$vpninfo{$vpn}{shouldbeup} = $status;
+untie(%vpninfo);
+}
+
+sub vpn_deregister
+{
+my ($vpn) = @_;
+
+my %vpninfo;
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+$vpninfo{$vpn} = undef;
+delete $vpninfo{$vpn}; # I do both of these because I'm not sure how the MLDBM stuff will handle it.
+untie(%vpninfo);
+}
+
+sub vpn_bump
+{ 	# Note in the vpninfo table that we have another VPN node. This is cached there because
+	# querying the vpn_nodes table is likely to be very expensive.
+my ($vpn) = @_;
+my %vpninfo;
+no strict 'subs'; # FIXME hack
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict;
+my %vpnstate = %{$vpninfo{$vpn}}; # For some reason, replacing it in-place does not work. MLDBM's fault, I imagine.
+$vpnstate{ovkeys} += 1;
+$vpninfo{$vpn} = \%vpnstate;
+untie(%vpninfo);
+}
+
+sub vpn_addnode
+{
+my ($vpn, $node) = @_;
+# Add a node to the db, also add to OpenSSL and make a config for it.
+my %vpn_nodes; # Do we want to lock this?
+no strict 'subs';
+my $dbfile = "$vpncfgdir/$vpn/vpn_nodes";
+tie(%vpn_nodes, 'MLDBM', $dbfile, O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpn_node db [$dbfile]: $!\n";
+use strict;
+if(defined $vpn_nodes{$vpn}{$node})
+	{die "Tried to create node that already exists: $vpn:$node\n";}
+
+$vpn_nodes{$vpn}{$node} = 1;
+untie(%vpn_nodes);
+create_vpn_node($vpn, $node); # SSL part. Should we generate a client config now?
+chmod(0644,"$vpncfgdir/$vpn/easy-rsa/keys/$node.key");
+vpn_bump($vpn);
+}
+
+sub vpn_exists
+{
+my ($vpn) = @_;
+
+my %vpninfo;
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+my $exists = 0;
+if(defined $vpninfo{$vpn})
+	{$exists = 1;}
+untie(%vpninfo);
+return $exists;
+}
+
+sub make_new_vpnid
+{ # A vpnid should be:
+	# Globally unique across reboots
+	# Composed of printable characters without spaces, angle brackets, or anything else that
+	#	is magic to the shell, to webpages, or similar. 
+	# Ideally, ordered
+	# Ideally, not too long
+	# Ideally, not terrible to type
+	# Let's just do the lazy thing and make it a single incrementer in its own database, but
+	#	make the code flexible enough to handle alphanumeric should we want to let people
+	#	name their VPN later. See identifier_is_valid() for the general assumptions code
+	#	should be prepared to accept in vpnids
+my $ret;
+my %conf;
+my $id_lockf = "$dbdir/vpnid_lock";
+if(! -f $id_lockf)
+	{
+	open(IDLOCKF, ">$id_lockf") || die "Failed to create id lockfile:$!\n";
+	close(IDLOCKF); # We just want it to exist so we can lock it.
+	}
+open(IDLOCKF, ">$id_lockf") || die "Failed to open id_lockfile:$!\n";
+flock(IDLOCKF, LOCK_EX) || die "make_new_vpnid: Failed to get lock\n"; # Exclusive lock on this file to prevent reentrancy concerns
+no strict 'subs'; # FIXME hack
+tie(%conf, 'SDBM_File', "$dbdir/vpnid", O_RDWR|O_CREAT, 0600) || die "Failed to open vpnid database";
+use strict;
+if(! defined $conf{vpnctr})
+	{$conf{vpnctr}=1;}
+$ret = $conf{vpnctr}++;
+untie(%conf);
+flock(IDLOCKF, LOCK_UN); # We're done, so let other processes unblock.
+close(IDLOCKF);
+return $ret;
+}
+
+sub vpn_initsettings
+{ # Completely replace/set the settings for a given VPN.
+my ($vpn, $settings) = @_;
+my %myvpn;
+
+$myvpn{shouldbeup} = 0;
+foreach my $key (keys %$settings)
+	{
+	$myvpn{$key} = $$settings{$key};
+	}
+
+no strict 'subs'; # FIXME hack to avoid a warning
+my %vpninfo;
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict; 
+$vpninfo{$vpn} = \%myvpn;
+untie(%vpninfo);
+}
+
+#################################################
+# Dirty systems work
+#
+# None of the functions here touch the local databases - this is a deliberate design
+# decision.
+
+sub copydir
+{ # Use tar to copy one directory into another. This function is copied from one of my other projects and is
+	# public domain.
+my ($in, $out) = @_;
+my $here = getcwd();
+my ($parent, $toget) = splitdir($in);
+chdir($parent) || die "Failed to enter parent src dir when copying template\n";
+open(HOLDER, "tar czf - $toget |") || die "Failed to start template source copy:$!\n";
+local $/; # We don't want any newlines polluting our tarfile! Enter slurp mode.
+my $tmp = <HOLDER>;
+close(HOLDER) || die "Failed to finish template read copy:$!\n";
+if(length($tmp) < 1)
+	{die "Failed to copy tmpfile: tar failed?\n";}
+
+chdir($out) || die "Failed to enter target dir when copying template\n";
+open(SENDOUT, "| tar xzf -") || die "Failed to start template target copy:$!\n";
+print SENDOUT $tmp;
+close(SENDOUT) || die "Failed to finish template target copy:$!\n";
+chdir($here) || die "Failed to return to beginning directory\n";
+}
+
+sub splitdir
+{ # Cut a path into its mostly part and its last part. This function is copied from one of my
+	# other projects and is public domain.
+my ($path) = @_;
+$path =~ s/\/$//; # Remove trailing slash, if any
+my @pparts = split(/\//, $path);
+my $lastpart = pop(@pparts);
+return (	join('/', @pparts),
+		$lastpart);
+}
+
+sub pid_exists
+{ # This is actually a lousy way to check to see if something is still running. Consider
+	# replacing it by asking openvpn to change its process name to the epoch timestamp, if
+	# that's doable. If not, this will have to do (although checking the process name to see
+	# if it's an OpenVPN would maybe give us an extra margin of safety). It's a pity that
+	# all this stuff is not super portable and need extra libraries.
+
+	# Note that if we run the dæmon on a system other than this, we will need to do this
+	# through a proxy.
+my ($pid) = @_;
+use Errno;
+
+kill(0, $pid); # Signal 0 is not supposed to do anything.
+if($! == Errno::ESRCH)
+	{return 0;}
+else	{return 1;}
+}
+
+sub down_pid
+{ # Low-level bring down the VPN. Don't wait around to see if the pid goes away.
+	# The OpenVPN docs say that SIGINT is the right thing to send.
+my ($pid, $rude) = @_;
+if($rude)
+	{
+	kill(9, $pid);
+	}
+else
+	{
+	kill(2, $pid); # XXX I think POSIX says signal 2 is supposed to be SIGINT globally. It's at least true on BSD and Linux.
+	}
+}
+
+sub up_vpn
+{ # XXX Do I need to set environment variables?
+my ($dir, $vpnname, $procname) = @_;
+
+my $here = getcwd();
+print "D: Entering directory [$dir]\n";
+chdir($dir) || die "Failed to enter vpndir $dir: $!\n";
+my $cmdline = "openvpn --config openvpn.conf --daemon \"$procname\"";
+print "Launching: (cmd: [ $cmdline ] )\n";
+system($cmdline); # TODO FIXME How can we tell if it launched successfully? walk the process tree? 
+	# The --echo flag tells it to prepend $vpnname to syslog for easier debugging
+	# The --daemon flag tells it to background and to rename itself as above.
+chdir($here);
+}
+
+sub create_vpn_node
+{ # Generate a clientkey for a vpn
+my ($vpn, $nodeid) = @_;
+
+my $dir = "$vpncfgdir/$vpn";
+my $here = getcwd();
+set_openssl_environment("$dir/easy-rsa");
+$ENV{KEY_CN} = $nodeid; # Set the common name for this certificate to that of the node for whose key we're generating.
+chdir($dir) || die "get_openssl_environment: Failed to enter dir [$dir]:$!\n";
+print "Running pkitool\n";
+`$bindir/pkitool $nodeid`;
+print "Done with pkitool\n";
+chdir($here);
+}
+
+sub free_vpn_nodes
+{ # Not sure I actually need this, so it's a stub. If we ever add the ability to delete members of a VPN, we'd fill this.
+my ($vpn, @nodeids) = @_;
+
+}
+
+####################################################
+
+#############
+# Very dirty systems work
+#	You may need to customise these for your Unix. Sorry!
+#
+# I am unhooking this for now; it'll be needed to automatically set up bridging and
+# for tun networks, but it's also broken and unnecessary for tap networks. It might not
+# even be worth supporting tun networks.
+
+sub vpn_interface
+{
+my ($vpnid) = @_;
+my $pid = vpn_pid($vpnid);
+if(defined $pid)
+	{
+	my @ifdata = `ifconfig -a`;
+	my $thisif='';
+	while(my $ifl = shift(@ifdata))
+		{
+		if($ifl =~ /^(\s+): /)
+			{$thisif = $1;}
+		if($ifl =~ /Opened by PID (\d+)/)
+			{
+			my $thispid = $1;
+			if($thispid == $pid)
+				{return $thisif;}
+			}
+		}
+	}
+return undef; # Either we didn't get a pid or we couldn't find an interface attached to it.
+}
+
+sub vpn_pid
+{ # Tempting to use one of the perl modules that wraps this, but it may be uncool to add as a dependency.
+my ($vpnid) = @_;
+my @pidl = `ps ax`; # Assume BSD or Linux ps - change to ps -ef if on SysV
+while(my $pidl = shift(@pidl))
+	{
+	if($pidl =~ /$pname\[$vpnid\]/) # Unique identifier for our VPN
+		{
+		$pidl =~ /^\s*(\d+)\s+/; # Match the number at the start of the ps line
+		my $pid = $1;
+		return $pid;
+		}
+	}
+return undef;
+}
+
+
+##################################################
+# Environment variables to do something with OpenSSL
+
+sub set_openssl_environment
+{
+my ($dir) = @_;
+#print "SOE called with dir [$dir]\n";
+$ENV{KEY_CN} = 'controller';
+$ENV{KEY_DIR} = 
+$ENV{KEY_EXPIRE} = 3650;
+$ENV{CA_EXPIRE} = 3650; # Doesn't really matter - no VPN should last that long.
+$ENV{KEY_SIZE} = 1024;
+$ENV{GREP} = 'grep';
+$ENV{EASY_RSA} = $dir;
+$ENV{KEY_DIR} = "$dir/keys";
+#$ENV{KEY_CONFIG} = `$bindir/whichopensslcnf $dir`;
+$ENV{KEY_CONFIG} = "$bindir/openssl.cnf"; # Fortunately, I *think* this file is template-ish enough that it can be reused
+$ENV{KEY_COUNTRY} = $country; # Filling all this in properly may be a bit pedantic,
+$ENV{KEY_PROVINCE} = $state; # for VPNs that will only last a few hours usually.
+$ENV{KEY_CITY} = $city;
+$ENV{KEY_ORG} = $org;
+$ENV{KEY_EMAIL} = $email;
+}
+
+####################################################
+# defensive programming
+
+sub identifier_is_valid
+{ # Turns out it's safer to be restrictive than catch the edge cases.
+	# If you want to expand the allowable characters, note that you should
+	# avoid allowing characters that could possibly be either
+	# 1) Be parsed specially in configfiles (particularly avoid $, backslashes and quotes of all kinds)
+	# 2) Be handled specially by the shell (avoid spaces plus the above)
+
+my ($vpnname) = @_;
+if($vpnname =~ /^[-A-Za-z0-9_]+$/) # Alphanumeric plus a few other possible characters
+	{return 1;}
+return 0; # Otherwise not kosher
+
+#return 0 if(! defined($vpnname)); # It must be defined
+#return 0 if($vpnname =~ /^\./); # No starting with dots
+#return 0 if($vpnname =~ /^$/); # Not empty
+}
+
+####################################################
+# pre sanity-checks
+sub presetup
+{ # Attempt to do checks to make metavpn work, also make sure paths exist that we need
+make_path($dbdir);
+make_path($vpncfgdir); # Technically makes the above unneeded, but clarity > brevity
+make_path($archive_old_configs); # Technically makes the above unneeded, but clarity > brevity
+if(! -d $easyrsa_template) # Avoid cluttering main() with this check
+	{die "Could not find easy-rsa template dir\n";}
+ensure_bindir($bindir);
+}
+
+sub ensure_bindir
+{ # OpenVPN needs a copy of the useful scripts around. We copy them out of the example directory, but once, shared between all VPNs
+if(-d $bindir) {return;}
+my ($targ_parent, $targ) = splitdir($bindir);
+my (undef, $tempname) = splitdir($easyrsa_template); # Probably will be "2.0", but let's be robust
+copydir($easyrsa_template, $targ_parent);
+move("$targ_parent/$tempname", "$targ_parent/$targ") || die "Something went badly awry in ensure_bindir()\n";
+}
+
+####################################################
+# general utilities
+
+sub safejoin($@)
+{
+my ($marker, @bits) = @_;
+my @revisedbits = map {defined $_ ? $_ : '(undefined)' } @bits; # Would love to use the 5.10 version: $_ // '(undefined)' instead
+return join($marker, @revisedbits);
+}
+

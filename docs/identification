@@ -1,0 +1,4 @@
+the --daemon flag takes an argument of "PROGNAME", allowing an openvpn to
+	take an arbitrary name.
+interfaces have metadata like "Opened by PID XXX" at the end
+

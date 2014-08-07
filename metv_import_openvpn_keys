@@ -1,0 +1,76 @@
+#!/usr/bin/perl -w
+
+use strict;
+use DBI;
+my $dbname = 'tbdb';
+my $keydir = q{.};
+
+main();
+
+###########################
+# This is much like the import_openvpn_keys from the homenet project, except...
+# we use the swid of mv_openvpn (instead of wa_openvpn) and use the
+# connection_id of whatever connection this should be. Table:
+#
+# id int(11)
+# node_id varchar(32)
+# connection_id int(11)
+# file varchar(4)
+# data text
+# swid varchar(20)
+#
+# We also require the user to provide the connection id of their VPN (not mandatory with other tool), and
+# force the tool to be run from the directory in which the keys reside
+###########################
+
+sub main
+{
+my %cfg = handle_args(@ARGV);
+my $dbh = db_connect();
+my $dbq = $dbh->prepare("INSERT INTO sw_configfiles(node_id,connection_id,file,data,swid) VALUES(?,?,?,?,?)");
+foreach my $suffix (qw/csr key crt/)
+	{
+	my $keyfile = "$keydir/$cfg{keyn}.$suffix";
+	open(KEYF, $keyfile) || die "Could not open keyfile $keyfile\n";
+	local $/; #slurrp
+	my $keydat = readline(KEYF);
+	$dbq->execute($cfg{keyn}, $cfg{conn}, $suffix, $keydat, 'mv_openvpn');
+	close(KEYF);
+	}
+# Now let's get the appropriate ca.crt and insert it in there under mvc_openvpn
+	{
+	my $crtfile = "$keydir/ca.crt";
+	open(CRTF, $crtfile) || die "Could not open cert $crtfile\n";
+	local $/;
+	my $crtdat = readline(CRTF);
+	my $crtr = $dbh->prepare("REPLACE INTO sw_configfiles(node_id,connection_id,file,data,swid) VALUES(?,?,?,?,?)");
+	$crtr->execute('VPN_SERVER', $cfg{conn}, 'crt', $crtdat, 'mvc_openvpn'); # Most fields here are ignored, we really just need the connectionid, the swid, and the actual cert
+	close(CRTF);
+	}
+}
+
+sub db_connect
+{
+my $dbh = DBI->connect("dbi:mysql:dbname=$dbname");
+if($dbh->ping)
+        {
+#	if($debug) {print "Connected";}
+        }
+else    
+	{die "Not connected: $!\n";}
+return $dbh;
+}
+
+sub handle_args
+{
+my @args = @_;
+my %ret;
+if(! @args)
+	{
+	die "Usage: metv_openvpn_keys keyname connection_id\nNote that you must have already generated the keyfiles! Use the connection-id metavpn gave you\n";
+	}
+$ret{keyn} = $args[0];
+$ret{conn} = $args[1];
+return %ret;
+}
+

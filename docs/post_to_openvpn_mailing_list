@@ -1,0 +1,80 @@
+Hello,
+
+I am integrating OpenVPN into network testbed software developed in a
+university environment, and would like a sanity check on my use of OpenVPN.
+My apologies for the verbosity.
+
+The basic idea of our software is that experimenters define a network
+topology and machine configuration they would like to work with and the
+software provides real machines that have that apparent topology. Behind the
+scenes, a single network testbed running this software has a pool of
+machines (which may or may not have public network interfaces - if not, they
+will also lack NAT) and 2 exposed administrative machines. The machine pools
+are frequently reimaged according to the OS preferences specified in the
+experiment description, and "hidden machines" do traffic shaping to insert
+packet drops, latency, and similar. A given pool of machines/testbed resides
+in a machine room in a university. Each machine in the pool has at least 2
+network connections, one "control plane connection" (typically static IPs)
+used to access nodes, and one or more "data plane connections" (with whatever
+IPs the user requested, traffic-shaped if appropriate, etc) used for
+inter-node in-experiment communication. The data plane connections are
+typically going into Cisco routers that have dynamically configured VLANs
+to appropriately isolate traffic.
+
+My integration of OpenVPN is designed to make federation of some types of
+testbeds possible. The testbed software already has the capability of
+allowing experiments to include nodes from other testbeds, provided that
+all nodes have public IPs - GRE tunnels are used to glue together these nodes
+into coherent/requested data planes. I intend to use OpenVPN to allow
+data planes to be created including nodes in testbeds which only have
+their administrative machines with public IPs. These nodes will connect
+to one or more dynamically allocated OpenVPN instances (I wrote code to
+dynamically generate OpenVPN configs, doing all the OpenSSL
+ca/keyserver/clientkey config, getting these keys to clients, and dynamically
+starting/stopping/removing multiple instances of OpenVPN) running on one
+of the local administrative machines, and this administrative machine will
+have another OpenVPN instance running in server-bridge mode to administrative
+machines in other testbeds that are part of this network and doing the same
+thing with their relevant client pool.
+
+Is this a good way to go?
+
+In sum, this is an expected usage (I am still working on gluing the last
+bits of the software together) - ops is the name of one of the administrative
+machine that's running my "metavpn" wrapper:
+
+Testbed A (only ops is public)
+      nodew1 (no public IP, no nat)
+      nodew2 (ditto)
+      (there are probably more nodes in this testbed but only these 2 are
+       part of this experiment)
+Testbed B (only ops is public)
+      nodew3 (ditto)
+Experiment defines a simple L2 eth network that everyone is on
+What we do:
+      A-ops dynamically allocates a L2 OpenVPN during experiment allocation,
+      B-ops dynamically allocates a L2 OpenVPN during experiment allocation,
+      A-ops and B-ops are joined by an OpenVPN running on A (or B) running in
+        --server-bridge mode to pass frames between (will this work?)
+
+Note that it is entirely likely that a given experiment will have several
+networks in it and hence multiple L2 VPN - their contents must be kept
+strictly isolated from each other for both performance and experimental
+validity reasons. The L2 VPNs create the data plane for these particular
+experiments, tunnelling over the control plane. The administrative machines
+will not participate in the L2 networks themselves, and clients will have
+static IPs assigned when IP is used.
+
+If there is a better way to do the OpenVPN parts of this, please let me know.
+I would be happy to provide more details. Additionally, if there's a way to do
+any of the following, I would be delighted to hear of it:
+
+1) Have a given OpenVPN server instance listen on both tcp and udp
+2) Have a given OpenVPN client instance first try talking udp but fallback to
+	tcp if it can't connect after awhile
+3) Have the vpns connect to each other without that third glue VPN
+4) Have OpenVPN intentionally introduce specified lag/latency into connections
+
+Thanks for any help you might provide.
+
+

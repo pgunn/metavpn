@@ -1,0 +1,269 @@
+#!/usr/bin/perl -w
+
+use strict;
+#my $dbdir = '/var/metapn'; # This directory must exist.
+my $dbdir = '/home/pgunn/notes/work/neta/metavpn/databases'; # testing purposes
+my $oconfig = q{openvpn-clients.cfg}; # Give a full path to this if you have it
+my $vpncfgdir = "$dbdir/cfgs";
+my $tarballs = "$dbdir/client-tarballs";
+my $clientpath = q{/etc/openvpn}; # Where configfiles assume tarballs are to be unpacked - to build paths in the config
+
+use Cwd;
+use SDBM_File;
+use MLDBM qw(SDBM_File);
+use Fcntl qw/:DEFAULT :flock/; # For DBM constants and flock()
+use File::Copy;
+use Archive::Tar;
+use File::Path 'make_path';
+
+presetup();
+main();
+
+# This software available under terms of the GENI public license, viewable at
+# http://www.geni.net/office/office_ip.html
+#########################
+# metv_direct_keygen
+#	Generates a tarball for client configs, without dealing with the Emulab database.
+#	This is a standalone configuration generator, suitable for use (with metavpn) outside
+#	of the Emulab environment (or inside of it for people who want something slightly off
+#	the paved path provided)
+#########################
+
+sub main
+{
+my %info = handle_args(@ARGV); #vpnid, nodeid
+if(! vpn_exists($info{vpnid}))
+	{die "VPN $info{vpnid} does not exist\n";}
+if(! -f "$dbdir/cfgs/$info{vpnid}/easy-rsa/keys/$info{nodeid}.crt")
+	{die "Cannot find certs for node $info{nodeid}\n";}
+
+my %cfg = figure_config($info{vpnid}, \%info);
+my $clientconf = fix_oconfig($oconfig, \%cfg);
+
+
+my $memtar = Archive::Tar->new();
+print "Generating tarball....\n";
+foreach my $suffix (qw/crt csr key/)
+	{
+	$memtar->add_data("$info{vpnid}/$info{nodeid}.$suffix", slurp_file("$dbdir/cfgs/$info{vpnid}/easy-rsa/keys/$info{nodeid}.$suffix") );
+	}
+$memtar->add_data("$info{vpnid}/ca.crt", slurp_file("$dbdir/cfgs/$info{vpnid}/easy-rsa/keys/ca.crt"));
+$memtar->add_data('openvpn.conf', $clientconf);
+$memtar->write("$tarballs/S$info{vpnid}-$info{nodeid}.tar");
+}
+
+sub handle_args
+{
+my @args = @_;
+my %ret;
+
+if(@args != 3)
+	{usage();}
+
+$ret{vpnid} = $_[0];
+$ret{nodeid} = $_[1];
+$ret{vpnd} = $_[2];
+return %ret;
+}
+
+sub usage
+{
+die "Usage: metv_direct_keygen vpn node vpnd\n";
+}
+
+sub fix_oconfig
+{
+my ($ctemplate, $cfg) = @_;
+
+my $nwk		= $$cfg{conid}; # This is numeric, and it's the vpnid
+my $nodeid	= $$cfg{nodeid};
+my $port	= $$cfg{port};
+my $vpnd	= $$cfg{vpnd}; # XXX differs from version in serve_openvpn_keys.cgi here
+my $dev		= $$cfg{dev}; # What kind of device to allocate.
+my $tdat = slurp_file($ctemplate);
+
+$tdat =~ s/\$vpnd/$vpnd/g; # Replace in-file placeholder with our variable
+$tdat =~ s/\$cfgpath/$clientpath/g;
+$tdat =~ s/\$cfgnwk/$nwk/g; 
+$tdat =~ s/\$clientname/$nodeid/g;
+$tdat =~ s/\$port/$port/g;
+$tdat =~ s/\$dev/$dev/g;
+return $tdat;
+}
+
+sub figure_config
+{ # Figure from the DBMs all the settings we need to fix up openvpn.conf
+my ($vpn, $info) = @_;
+my %ret;
+
+$ret{conid} = $vpn; # numeric connectionid
+$ret{nodeid} = $$info{nodeid};
+$ret{vpnd} = $$info{vpnd}; # We're flat-out told this by the user
+
+my %info = vpn_info($vpn); # Eventually, we'll want to get "type" out of this, and maybe "server" should be where
+				# the "vpnd" field comes from? 
+$ret{port} = $info{port};
+$ret{dev} = $info{type};
+
+return %ret;
+}
+
+#############################################################
+# "Database" functions
+#
+# Databases:
+#	vpninfo
+#		{vpnid}
+#			{shouldbeup}
+#			{nodes} @
+#			{type}
+#			{iface}
+#			{server}
+#			{port}
+#			{exp}
+#			{expnet}
+#			{ovkeys}
+#
+#	keys
+#		{vpnid}
+#			{keyid}
+#				(note that the needed info to make client configs is
+#				in $vpncfgdir/$vpn/keys/$keyid* and some other files in that
+#				directory)
+
+sub vpn_info
+{
+my ($vpnid) = @_;
+my %ret;
+
+my %vpninfo;
+no strict 'subs';
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+use strict;
+my $retcpy = $vpninfo{$vpnid}; # We need to do a deep copy before untie, I think.
+foreach my $key (keys %$retcpy)
+	{
+#	print "D: read VPNINFO{$vpnid}{$key} = $$retcpy{$key}\n";
+	$ret{$key} = $$retcpy{$key};
+	}
+#print "Seeking vpn $vpnid\n";
+#print "BEGIN\n";
+#print map {"\tLALA=$_\n"} (keys %vpninfo);
+#print "END\n";
+untie(%vpninfo);
+return %ret;
+}
+
+sub vpn_exists
+{
+my ($vpn) = @_;
+
+my %vpninfo;
+tie(%vpninfo, 'MLDBM', "$dbdir/vpninfo", O_CREAT|O_RDWR, 0600) || die "Failed to attach to vpninfo db: $!\n";
+my $exists = 0;
+if(defined $vpninfo{$vpn})
+	{$exists = 1;}
+untie(%vpninfo);
+return $exists;
+}
+
+#################################################
+# Dirty systems work
+#
+# None of the functions here touch the local databases - this is a deliberate design
+# decision.
+
+sub copydir
+{ # Use tar to copy one directory into another. This function is copied from one of my other projects and is
+	# public domain.
+my ($in, $out) = @_;
+my $here = getcwd();
+my ($parent, $toget) = splitdir($in);
+chdir($parent) || die "Failed to enter parent src dir when copying template\n";
+open(HOLDER, "tar czf - $toget |") || die "Failed to start template source copy:$!\n";
+local $/; # We don't want any newlines polluting our tarfile! Enter slurp mode.
+my $tmp = <HOLDER>;
+close(HOLDER) || die "Failed to finish template read copy:$!\n";
+if(length($tmp) < 1)
+	{die "Failed to copy tmpfile: tar failed?\n";}
+
+chdir($out) || die "Failed to enter target dir when copying template\n";
+open(SENDOUT, "| tar xzf -") || die "Failed to start template target copy:$!\n";
+print SENDOUT $tmp;
+close(SENDOUT) || die "Failed to finish template target copy:$!\n";
+chdir($here) || die "Failed to return to beginning directory\n";
+}
+
+sub splitdir
+{ # Cut a path into its mostly part and its last part. This function is copied from one of my
+	# other projects and is public domain.
+my ($path) = @_;
+$path =~ s/\/$//; # Remove trailing slash, if any
+my @pparts = split(/\//, $path);
+my $lastpart = pop(@pparts);
+return (	join('/', @pparts),
+		$lastpart);
+}
+
+sub pid_exists
+{ # This is actually a lousy way to check to see if something is still running. Consider
+	# replacing it by asking openvpn to change its process name to the epoch timestamp, if
+	# that's doable. If not, this will have to do (although checking the process name to see
+	# if it's an OpenVPN would maybe give us an extra margin of safety). It's a pity that
+	# all this stuff is not super portable and need extra libraries.
+
+	# Note that if we run the dæmon on a system other than this, we will need to do this
+	# through a proxy.
+my ($pid) = @_;
+use Errno;
+
+kill(0, $pid); # Signal 0 is not supposed to do anything.
+if($! == Errno::ESRCH)
+	{return 0;}
+else	{return 1;}
+}
+
+sub down_pid
+{ # Low-level bring down the VPN. Don't wait around to see if the pid goes away.
+	# The OpenVPN docs say that SIGINT is the right thing to send.
+my ($pid, $rude) = @_;
+if($rude)
+	{
+	kill(9, $pid);
+	}
+else
+	{
+	kill(2, $pid); # XXX I think POSIX says signal 2 is supposed to be SIGINT globally. It's at least true on BSD and Linux.
+	}
+}
+
+
+
+####################################################
+# general utilities
+
+sub safejoin($@)
+{
+my ($marker, @bits) = @_;
+my @revisedbits = map {defined $_ ? $_ : '(undefined)' } @bits; # Would love to use the 5.10 version: $_ // '(undefined)' instead
+return join($marker, @revisedbits);
+}
+
+sub slurp_file
+{
+my ($fts) = @_;
+open(FTS, $fts) || die "Failed to open $fts:$!\n";
+local $/;
+my $ret = readline(FTS);
+close(FTS);
+return $ret;
+}
+
+####################################################
+# prerun
+
+sub presetup
+{
+make_path($tarballs);
+}
+

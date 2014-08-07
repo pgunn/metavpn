@@ -1,0 +1,46 @@
+Function:
+	Metavpn has the task of dynamically creating/configuring openvpn
+	instances for nodes to connect to. This is useful in allowing nodes
+	with networking oddities (e.g. NAT or no internet routing at all)
+	to participate in experiments. One expected topology would be:
+
+	Testbed A (all nodes have public IPs)
+		nodew1
+		nodew2
+		nodew3
+	Testbed B (only boss/ops are public)
+		nodew4
+		nodew5
+	Experiment has a simple eth network that everyone is on
+	Done:
+		B-ops dynamically allocates a L2 OpenVPN during swapin,
+		all nodes join it as they come up, the A-nodes over
+		the public internet, the B-nodes through their connection
+		to B-ops.
+
+	Another topology:
+
+	Testbed B (only boss/ops are public)
+		nodew1
+		nodew2
+	Testbed C (only boss/ops are public)
+		nodew3
+	Experiment has a simple eth network that everyone is on
+	Done:
+		B-ops dynamically allocates a L2 OpenVPN during swapin,
+		C-ops dynamically allocates a L2 OpenVPN during swapin,
+		B-ops and C-ops are joined by an openvpn running in
+			--server-bridge mode
+			(we must enable packet forwarding from the vpn
+			on each side to the bridge)
+
+
+metavpn does not run on boss. This is because:
+	metavpn does the dirty work of generating configfiles, starting and
+	stopping openvpn as needed, and configuring a SSL instance.
+	It's easier to do this on the same machine as the openvpn servers.
+	This does impose some challenges.
+
+For now, metavpn is assumed to run on ops. It is an explicit design factor
+	that it should not rely on running on ops (perhaps running on a
+	dedicated server).

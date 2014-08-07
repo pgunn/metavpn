@@ -1,0 +1,78 @@
+How to do the ssl stuff noninteractively..
+
+1) Set vars to be equivalent to what's set by the 'vars' file
+2) clean-all
+	Is safe to run from the script. However, it is better to have the
+	template directory such that it is not necessary.
+3) build-ca
+	This sets the EASY_RSA environment variable, then does:
+	pkitool --interact --initca
+
+	Relevant environment variables:
+		KEY_CN
+		KEY_ORG
+		KEY_NAME
+		KEY_OU
+		KEY_EXPIRE
+		CA_EXPIRE
+
+	Running it interactively::
+		Generating a 1024 bit RSA private key
+		writing new private key to 'ca.key'
+
+		Country Name (2 letter code) [US]:
+		State or Province Name (full name) [CA]:PA
+		Locality Name (eg, city) [SanFrancisco]:Pittsburgh
+		Organization Name (eg, company) [Fort-Funston]:CMU-CS-CMULAB-OPENVPN-DYNAMIC
+		Organizational Unit Name (eg, section) []:
+		Common Name (eg, your name or your server's hostname) [Fort-Funston CA]:controller
+		Name []:
+		Email Address [me@myhost.mydomain]:pgunn@cs.cmu.edu
+	I believe that we want then to do:
+		export KEY_CN=controller
+		export KEY_EXPIRE=3650
+		export CA_EXPIRE=3650
+		export KEY_SIZE=1024
+		export GREP="grep"
+		export EASY_RSA=/path/to/easy-rsa/dir
+		
+		export KEY_DIR=/path/to/keys/dir/under/easy-rsa/is/what/we/want
+		export KEY_CONFIG=`/path/to/easy-rsa/dir/whichopensslcnf /path/to/easy-rsa/dir`
+			# These should not be hardcoded
+		export KEY_COUNTY=US
+		export KEY_PROVINCE=PA
+		export KEY_CITY=Pittsburgh
+		export KEY_ORG=CMU-CS-CMULAB-OPENVPN-DYNAMIC
+		export KEY_EMAIL=pgunn@cs.cmu.edu
+
+		pkitool --initca
+	Looks good so far (not sure how to test this)
+
+4) build-key-server servername
+	this calls "pkitool --interact --server servername
+
+	Internally, this:
+		appends "-extensions server" to REQ_EXT
+		appends "-extensions server" to CA_EXT
+
+	With all the above vars set, it appears to work correctly.
+5) build-dh
+	Hopefully not interactive. Runs:
+
+	openssl dhparam -out $KEY_DIR/dh$KEY_SIZE.pem $KEY_SIZE
+
+	This runs in curses, but is not interactive. It should be safe to script.
+6) Building client keys
+	pkitool nodename
+
+	This works fine with no interactivity.
+
+So:
+	Provided that we:
+		1) Copy the skeleton into that directory correctly
+		2) Set the environment variables correctly
+		3) Invoke pkitool/openssl directly
+	we'll be able to generate these keys without any problem.
+
+This concludes the concerns about generating valid ssl keys for openvpn.
+
